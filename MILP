@@ -1,1 +1,208 @@
 
+import pandas as pd
+import pulp
+
+# ==========================================
+# 1. ĐỌC DỮ LIỆU TỪ EXCEL (Code gốc của bạn)
+# ==========================================
+file_path = r"C:\Users\My Pc\Downloads\data bài toán (1).xlsx"
+file_path = file_path.replace("\\", "/").strip('"')
+
+excel_file = pd.ExcelFile(file_path)
+sheet_names = excel_file.sheet_names
+
+print("\nList of sheets in the file:")
+for i, sheet in enumerate(sheet_names):
+    print(f"{i} - {sheet}")
+
+while True:
+    try:
+        print("\nPlease select the sheet you want to scan, based on its corresponding number:")
+        chosen_sheet = int(input())
+        print(f"Selected sheet: {sheet_names[chosen_sheet]}")
+
+        print("Please enter your header row - Based on the excel file (e.g., 1 for row 1):")
+        selected_row = int(input())
+
+        df = pd.read_excel(
+            file_path,
+            sheet_name=sheet_names[chosen_sheet],
+            header=selected_row - 1
+        )
+        print("\n--> Read sheet successfully!")
+        break
+    except Exception as e:
+        print(f"Error reading sheet: {e}. Please try again.")
+
+# ==========================================
+# 2. XỬ LÝ DỮ LIỆU CÔNG VIỆC (Code gốc của bạn)
+# ==========================================
+jobDict = {}
+for job, pt, dd, rd, fm, st, clr, wei in zip(
+    df['job'], df['processing_time (minutes)'], df['Due_date'],
+    df['Ready_date'], df['category'], df['STYLE'], df['COLOR'], df['Weighted average (percentage)']
+):
+    job_str = str(job)
+    if ('pt' + job_str) not in jobDict:
+        jobDict['pt' + job_str] = pt
+    else:
+        jobDict['pt' + job_str] += pt
+        
+    if ('dd' + job_str) not in jobDict:
+        jobDict['dd' + job_str] = dd
+    if ('rd' + job_str) not in jobDict:
+        jobDict['rd' + job_str] = rd
+    if ('fm' + job_str) not in jobDict:
+        jobDict['fm' + job_str] = fm
+    if ('st' + job_str) not in jobDict:
+        jobDict['st' + job_str] = st
+        
+    if ('clr' + job_str) not in jobDict:
+        jobDict['clr' + job_str] = 1
+    else:
+        jobDict['clr' + job_str] += 1
+        jobDict['pt' + job_str] += 25  # Phụ phí 25 phút cho mỗi dòng màu thêm
+        
+    if ('wei' + job_str) not in jobDict:
+        jobDict['wei' + job_str] = wei
+    else:
+        jobDict['wei' + job_str] += wei
+
+# Lọc danh sách công việc độc lập (Jobs)
+J = [k.replace('pt', '') for k in jobDict.keys() if k.startswith('pt')]
+K = [f"K{i}" for i in range(1, 12)]  # 11 chuyền may từ K1 đến K11
+
+# ==========================================
+# 3. KHAI BÁO MÔ HÌNH VÀ THAM SỐ TOÁN HỌC
+# ==========================================
+model = pulp.LpProblem("Sewing_Line_Scheduling_MIP", pulp.LpMinimize)
+
+CAP = 10752.0  # Năng lực 1 chuyền/ngày (phút)
+M = 500000.0   # Hằng số Big-M
+
+# Tính ma trận thời gian setup s_ij giữa 2 job i và j (tính bằng phút)
+s = {}
+for i in J:
+    for j in J:
+        if i != j:
+            if jobDict['fm' + i] != jobDict['fm' + j]:
+                s[i, j] = 10752.0      # 1 ngày đổi nhóm category
+            elif jobDict['st' + i] != jobDict['st' + j]:
+                s[i, j] = 2150.4       # 0.2 ngày đổi style
+            else:
+                s[i, j] = 5.0          # 5 phút đổi PO/màu cùng style
+
+# ==========================================
+# 4. BIẾN QUYẾT ĐỊNH (DECISION VARIABLES)
+# ==========================================
+# x[j, k] = 1 nếu job j xếp trên chuyền k
+x = pulp.LpVariable.dicts("x", ((j, k) for j in J for k in K), cat=pulp.LpBinary)
+
+# y[i, j] = 1 nếu job j làm ngay sau job i trên cùng chuyền
+y = pulp.LpVariable.dicts("y", ((i, j) for i in J for j in J if i != j), cat=pulp.LpBinary)
+
+# y_start[j] = 1 nếu job j là job đầu tiên mở chuyền
+y_start = pulp.LpVariable.dicts("y_start", J, cat=pulp.LpBinary)
+
+# Biến thời gian liên tục (tính bằng phút, ngoại trừ T_j tính theo ngày)
+S = pulp.LpVariable.dicts("S", J, lowBound=0, cat=pulp.LpContinuous)
+C = pulp.LpVariable.dicts("C", J, lowBound=0, cat=pulp.LpContinuous)
+T = pulp.LpVariable.dicts("T", J, lowBound=0, cat=pulp.LpContinuous)
+
+# ==========================================
+# 5. HÀM MỤC TIÊU (OBJECTIVE FUNCTION)
+# ==========================================
+# Min Z = Sum(w_j * T_j)
+model += pulp.lpSum(jobDict['wei' + j] * T[j] for j in J), "Minimize_Weighted_Lateness"
+
+# ==========================================
+# 6. CÁC RÀNG BUỘC (CONSTRAINTS)
+# ==========================================
+
+# (R1) Phân bổ chuyền duy nhất: Mỗi job j thuộc đúng 1 chuyền
+for j in J:
+    model += pulp.lpSum(x[j, k] for k in K) == 1, f"R1_Unique_Line_{j}"
+
+# (R2a & R2b) Cân bằng luồng trình tự (Flow Conservation)
+for j in J:
+    model += (
+        pulp.lpSum(y[i, j] for i in J if i != j) + y_start[j] == 1,
+        f"R2a_Predecessor_Balance_{j}"
+    )
+
+for i in J:
+    model += (
+        pulp.lpSum(y[i, j] for j in J if j != i) <= 1,
+        f"R2b_Successor_Balance_{i}"
+    )
+
+# (R2c) Giới hạn tối đa 11 job mở chuyền
+model += pulp.lpSum(y_start[j] for j in J) <= len(K), "R2c_Max_Line_Starts"
+
+# (R3a & R3b) Job i và j chỉ nối tiếp được nếu cùng chuyền k
+for i in J:
+    for j in J:
+        if i != j:
+            for k in K:
+                model += y[i, j] <= 1 + x[i, k] - x[j, k], f"R3a_SameLine_{i}_{j}_{k}"
+                model += y[i, j] <= 1 - x[i, k] + x[j, k], f"R3b_SameLine_{i}_{j}_{k}"
+
+# (R4) Nguyên phụ liệu sẵn sàng kho (Đổi rd từ ngày -> phút)
+for j in J:
+    model += S[j] >= jobDict['rd' + j] * CAP, f"R4_Ready_Date_{j}"
+
+# (R5) Thời điểm hoàn thành job (C_j = S_j + p_j)
+for j in J:
+    model += C[j] == S[j] + jobDict['pt' + j], f"R5_Completion_Time_{j}"
+
+# (R6) Trình tự nối tiếp và thời gian chuyển đổi mã s_ij (Big-M)
+for i in J:
+    for j in J:
+        if i != j:
+            model += S[j] >= C[i] + s[i, j] - M * (1 - y[i, j]), f"R6_Setup_Sequence_{i}_{j}"
+
+# (R7) Số ngày trễ hạn T_j (Đổi d_j từ ngày -> phút, sau đó quy đổi T_j ra số ngày)
+for j in J:
+    model += T[j] >= (C[j] - jobDict['dd' + j] * CAP) / CAP, f"R7_Lateness_Days_{j}"
+
+# ==========================================
+# 7. GIẢI MÔ HÌNH TOÁN
+# ==========================================
+print("\n--> Đang tiến hành giải mô hình toán học tối ưu...")
+# Bạn có thể thay đổi timeLimit (giây) tùy thuộc vào quy mô dữ liệu
+solver = pulp.PULP_CBC_CMD(msg=True, timeLimit=300)
+status = model.solve(solver)
+
+# ==========================================
+# 8. XUẤT KẾT QUẢ VÀ TỔNG HỢP LỊCH SẢN XUẤT
+# ==========================================
+print("\n" + "="*50)
+print(f"Trạng thái tối ưu: {pulp.LpStatus[status]}")
+print(f"Tổng độ trễ có trọng số Z (Optimal Fitness) = {pulp.value(model.objective):.6f}")
+print("="*50)
+
+# Xuất danh sách chi tiết các công việc trên từng chuyền
+schedule_results = []
+for k in K:
+    for j in J:
+        if pulp.value(x[j, k]) > 0.5:
+            start_min = pulp.value(S[j])
+            end_min = pulp.value(C[j])
+            lateness_days = pulp.value(T[j])
+            schedule_results.append({
+                'Line': k,
+                'Job': j,
+                'Category': jobDict['fm' + j],
+                'Style': jobDict['st' + j],
+                'Start (Ngày)': round(start_min / CAP, 2),
+                'End (Ngày)': round(end_min / CAP, 2),
+                'Due Date (Ngày)': jobDict['dd' + j],
+                'Trễ (Ngày)': round(lateness_days, 2),
+                'Trọng số w (%)': round(jobDict['wei' + j], 5)
+            })
+
+df_schedule = pd.DataFrame(schedule_results)
+df_schedule = df_schedule.sort_values(by=['Line', 'Start (Ngày)']).reset_index(drop=True)
+
+print("\n--- BẢNG KẾT QUẢ LẬP LỊCH CHI TIẾT ---")
+print(df_schedule.to_string(index=False))
